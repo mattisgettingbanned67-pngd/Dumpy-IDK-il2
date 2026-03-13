@@ -13,6 +13,7 @@ A stronger CMake-based IL2CPP dumper that builds to a Windows `.exe` and support
 - x64/x86 PE detection from `GameAssembly.dll` (no hardcoded 64-bit assumption).
 - Better heuristic for method-pointer table scanning across `.rdata` and `.data` with scoring against metadata method count.
 - Output path support with `--out`.
+- Optional JSON output with `--json` for toolchain/automation workflows.
 
 ## Build (Windows)
 ```bat
@@ -38,6 +39,11 @@ IL2CppOffsetDumper.exe "C:\path\global-metadata.dat" "C:\path\GameAssembly.dll"
 ### Set custom output path
 ```bat
 IL2CppOffsetDumper.exe "C:\path\global-metadata.dat" "C:\path\GameAssembly.dll" --out "C:\path\dump.cs"
+```
+
+### JSON output
+```bat
+IL2CppOffsetDumper.exe "C:\path\global-metadata.dat" "C:\path\GameAssembly.dll" --json
 ```
 
 Default output file: `dump.cs` in the current working directory.

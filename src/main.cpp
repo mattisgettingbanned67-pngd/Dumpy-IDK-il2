@@ -177,6 +177,7 @@ struct Args {
     fs::path metadataPath;
     fs::path gameAssemblyPath;
     fs::path outputPath = "dump.cs";
+    bool jsonOutput = false;
 };
 
 struct CandidateTable {
@@ -202,6 +203,7 @@ static std::string readLine(const std::string& prompt) {
 static void printUsage(const char* exe) {
     std::cout << "Usage:\n";
     std::cout << "  " << exe << " <global-metadata.dat> <GameAssembly.dll> [--out <file>]\n";
+    std::cout << "  " << exe << " <global-metadata.dat> <GameAssembly.dll> [--json] [--out <file>]\n";
     std::cout << "  " << exe << "  (interactive drag-and-drop prompts)\n\n";
 }
 
@@ -221,6 +223,13 @@ static std::optional<Args> parseArgs(int argc, char* argv[]) {
                 return std::nullopt;
             }
             args.outputPath = trimQuotes(argv[++i]);
+            continue;
+        }
+        if (current == "--json") {
+            args.jsonOutput = true;
+            if (args.outputPath == "dump.cs") {
+                args.outputPath = "dump.json";
+            }
             continue;
         }
         positional.push_back(current);
@@ -318,6 +327,22 @@ static bool ptrToRva(const PEInfo& pe, uint64_t ptr, uint32_t& outRva) {
     if (rva64 > 0xFFFFFFFFull) return false;
     outRva = static_cast<uint32_t>(rva64);
     return true;
+}
+
+static std::string jsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out.push_back(c); break;
+        }
+    }
+    return out;
 }
 
 static std::optional<Section> findSection(const PEInfo& pe, const std::string& name) {
@@ -506,76 +531,161 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    out << "// IL2CPP Dump\n";
-    out << "// MetadataVersion: " << header->version << "\n";
-    out << "// TypeCount: " << typeDefCount << "\n";
-    out << "// MethodCount: " << methodCount << "\n";
-    out << "// FieldCount: " << fieldCount << "\n";
-    out << "// PE: " << (pe->is64Bit ? "x64" : "x86") << "\n";
-    out << "// RVA mode: " << (table ? "heuristic" : "unresolved") << "\n\n";
+    if (args.jsonOutput) {
+        out << "{\n";
+        out << "  \"metadataVersion\": " << header->version << ",\n";
+        out << "  \"typeCount\": " << typeDefCount << ",\n";
+        out << "  \"methodCount\": " << methodCount << ",\n";
+        out << "  \"fieldCount\": " << fieldCount << ",\n";
+        out << "  \"pe\": \"" << (pe->is64Bit ? "x64" : "x86") << "\",\n";
+        out << "  \"rvaMode\": \"" << (table ? "heuristic" : "unresolved") << "\",\n";
+        out << "  \"images\": [\n";
 
-    for (uint32_t i = 0; i < imageCount; ++i) {
-        const auto& img = images[i];
-        const std::string imageName = readCString(metadata, header->stringOffset, img.nameIndex);
-        out << "// ===== Image: " << imageName << " =====\n";
+        bool firstImage = true;
+        for (uint32_t i = 0; i < imageCount; ++i) {
+            const auto& img = images[i];
+            const std::string imageName = readCString(metadata, header->stringOffset, img.nameIndex);
 
-        const uint32_t start = (img.typeStart < 0) ? 0u : static_cast<uint32_t>(img.typeStart);
-        const uint32_t end = std::min(typeDefCount, start + img.typeCount);
+            if (!firstImage) out << ",\n";
+            firstImage = false;
+            out << "    {\n";
+            out << "      \"name\": \"" << jsonEscape(imageName) << "\",\n";
+            out << "      \"types\": [\n";
 
-        for (uint32_t t = start; t < end; ++t) {
-            const auto& td = typeDefs[t];
-            const std::string ns = readCString(metadata, header->stringOffset, td.namespaceIndex);
-            const std::string typeName = readCString(metadata, header->stringOffset, td.nameIndex);
+            const uint32_t start = (img.typeStart < 0) ? 0u : static_cast<uint32_t>(img.typeStart);
+            const uint32_t end = std::min(typeDefCount, start + img.typeCount);
+            bool firstType = true;
+            for (uint32_t t = start; t < end; ++t) {
+                const auto& td = typeDefs[t];
+                const std::string ns = readCString(metadata, header->stringOffset, td.namespaceIndex);
+                const std::string typeName = readCString(metadata, header->stringOffset, td.nameIndex);
 
-            out << "namespace " << (ns.empty() ? "<global>" : ns) << " {\n";
-            out << "class " << (typeName.empty() ? "<unnamed_type>" : typeName)
-                << " // TypeDefIndex: " << t
-                << " Token: 0x" << std::hex << td.token << std::dec
-                << "\n{\n";
+                if (!firstType) out << ",\n";
+                firstType = false;
+                out << "        {\n";
+                out << "          \"typeDefIndex\": " << t << ",\n";
+                out << "          \"token\": " << td.token << ",\n";
+                out << "          \"namespace\": \"" << jsonEscape(ns) << "\",\n";
+                out << "          \"name\": \"" << jsonEscape(typeName) << "\",\n";
+                out << "          \"fields\": [\n";
 
-            for (uint16_t fi = 0; fi < td.field_count; ++fi) {
-                const int32_t fIndex = td.fieldStart + fi;
-                if (fIndex < 0 || static_cast<uint32_t>(fIndex) >= fieldCount) continue;
-                const auto& fd = fields[fIndex];
-                const std::string fieldName = readCString(metadata, header->stringOffset, fd.nameIndex);
-                out << "    // FieldDefIndex: " << fIndex
-                    << " | Token: 0x" << std::hex << fd.token << std::dec << "\n";
-                out << "    <field> " << (fieldName.empty() ? "<unnamed_field>" : fieldName) << ";\n";
+                bool firstField = true;
+                for (uint16_t fi = 0; fi < td.field_count; ++fi) {
+                    const int32_t fIndex = td.fieldStart + fi;
+                    if (fIndex < 0 || static_cast<uint32_t>(fIndex) >= fieldCount) continue;
+                    const auto& fd = fields[fIndex];
+                    const std::string fieldName = readCString(metadata, header->stringOffset, fd.nameIndex);
+                    if (!firstField) out << ",\n";
+                    firstField = false;
+                    out << "            {\"fieldDefIndex\": " << fIndex
+                        << ", \"token\": " << fd.token
+                        << ", \"name\": \"" << jsonEscape(fieldName) << "\"}";
+                }
+                out << "\n          ],\n";
+                out << "          \"methods\": [\n";
+
+                bool firstMethod = true;
+                for (uint16_t mi = 0; mi < td.method_count; ++mi) {
+                    const int32_t mIndex = td.methodStart + mi;
+                    if (mIndex < 0 || static_cast<uint32_t>(mIndex) >= methodCount) continue;
+                    const auto& md = methods[mIndex];
+                    const std::string methodName = readCString(metadata, header->stringOffset, md.nameIndex);
+                    if (!firstMethod) out << ",\n";
+                    firstMethod = false;
+                    out << "            {\"methodDefIndex\": " << mIndex
+                        << ", \"token\": " << md.token
+                        << ", \"methodIndex\": " << md.methodIndex
+                        << ", \"params\": " << md.parameterCount;
+
+                    if (md.methodIndex >= 0 && static_cast<size_t>(md.methodIndex) < methodPtrs.size()) {
+                        const uint64_t va = methodPtrs[md.methodIndex];
+                        uint32_t rva = 0;
+                        if (ptrToRva(*pe, va, rva)) {
+                            out << ", \"rva\": " << rva;
+                        }
+                    }
+                    out << ", \"name\": \"" << jsonEscape(methodName) << "\"}";
+                }
+                out << "\n          ]\n";
+                out << "        }";
             }
+            out << "\n      ]\n";
+            out << "    }";
+        }
+        out << "\n  ]\n";
+        out << "}\n";
+    } else {
+        out << "// IL2CPP Dump\n";
+        out << "// MetadataVersion: " << header->version << "\n";
+        out << "// TypeCount: " << typeDefCount << "\n";
+        out << "// MethodCount: " << methodCount << "\n";
+        out << "// FieldCount: " << fieldCount << "\n";
+        out << "// PE: " << (pe->is64Bit ? "x64" : "x86") << "\n";
+        out << "// RVA mode: " << (table ? "heuristic" : "unresolved") << "\n\n";
 
-            if (td.field_count > 0) out << "\n";
+        for (uint32_t i = 0; i < imageCount; ++i) {
+            const auto& img = images[i];
+            const std::string imageName = readCString(metadata, header->stringOffset, img.nameIndex);
+            out << "// ===== Image: " << imageName << " =====\n";
 
-            for (uint16_t mi = 0; mi < td.method_count; ++mi) {
-                const int32_t mIndex = td.methodStart + mi;
-                if (mIndex < 0 || static_cast<uint32_t>(mIndex) >= methodCount) continue;
+            const uint32_t start = (img.typeStart < 0) ? 0u : static_cast<uint32_t>(img.typeStart);
+            const uint32_t end = std::min(typeDefCount, start + img.typeCount);
 
-                const auto& md = methods[mIndex];
-                const std::string methodName = readCString(metadata, header->stringOffset, md.nameIndex);
-                out << "    // MethodDefIndex: " << mIndex
-                    << " | Token: 0x" << std::hex << md.token << std::dec
-                    << " | MethodIndex: " << md.methodIndex
-                    << " | Params: " << md.parameterCount;
+            for (uint32_t t = start; t < end; ++t) {
+                const auto& td = typeDefs[t];
+                const std::string ns = readCString(metadata, header->stringOffset, td.namespaceIndex);
+                const std::string typeName = readCString(metadata, header->stringOffset, td.nameIndex);
 
-                if (md.methodIndex >= 0 && static_cast<size_t>(md.methodIndex) < methodPtrs.size()) {
-                    const uint64_t va = methodPtrs[md.methodIndex];
-                    uint32_t rva = 0;
-                    if (ptrToRva(*pe, va, rva)) {
-                        out << " | RVA: 0x" << std::hex << rva << std::dec;
+                out << "namespace " << (ns.empty() ? "<global>" : ns) << " {\n";
+                out << "class " << (typeName.empty() ? "<unnamed_type>" : typeName)
+                    << " // TypeDefIndex: " << t
+                    << " Token: 0x" << std::hex << td.token << std::dec
+                    << "\n{\n";
+
+                for (uint16_t fi = 0; fi < td.field_count; ++fi) {
+                    const int32_t fIndex = td.fieldStart + fi;
+                    if (fIndex < 0 || static_cast<uint32_t>(fIndex) >= fieldCount) continue;
+                    const auto& fd = fields[fIndex];
+                    const std::string fieldName = readCString(metadata, header->stringOffset, fd.nameIndex);
+                    out << "    // FieldDefIndex: " << fIndex
+                        << " | Token: 0x" << std::hex << fd.token << std::dec << "\n";
+                    out << "    <field> " << (fieldName.empty() ? "<unnamed_field>" : fieldName) << ";\n";
+                }
+
+                if (td.field_count > 0) out << "\n";
+
+                for (uint16_t mi = 0; mi < td.method_count; ++mi) {
+                    const int32_t mIndex = td.methodStart + mi;
+                    if (mIndex < 0 || static_cast<uint32_t>(mIndex) >= methodCount) continue;
+
+                    const auto& md = methods[mIndex];
+                    const std::string methodName = readCString(metadata, header->stringOffset, md.nameIndex);
+                    out << "    // MethodDefIndex: " << mIndex
+                        << " | Token: 0x" << std::hex << md.token << std::dec
+                        << " | MethodIndex: " << md.methodIndex
+                        << " | Params: " << md.parameterCount;
+
+                    if (md.methodIndex >= 0 && static_cast<size_t>(md.methodIndex) < methodPtrs.size()) {
+                        const uint64_t va = methodPtrs[md.methodIndex];
+                        uint32_t rva = 0;
+                        if (ptrToRva(*pe, va, rva)) {
+                            out << " | RVA: 0x" << std::hex << rva << std::dec;
+                        } else {
+                            out << " | RVA: N/A";
+                        }
                     } else {
                         out << " | RVA: N/A";
                     }
-                } else {
-                    out << " | RVA: N/A";
-                }
-                out << "\n";
+                    out << "\n";
 
-                out << "    void " << (methodName.empty() ? "<unnamed_method>" : methodName) << "();\n\n";
+                    out << "    void " << (methodName.empty() ? "<unnamed_method>" : methodName) << "();\n\n";
+                }
+
+                out << "}\n}\n\n";
             }
 
-            out << "}\n}\n\n";
+            out << "\n";
         }
-
-        out << "\n";
     }
 
     std::cout << "[+] Done!\n";
